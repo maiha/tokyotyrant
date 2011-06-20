@@ -36,3 +36,13 @@ Thanks.
 
 
 == END OF FILE ==
+
+
+https://github.com/maiha/tokyotyrant
+
+Added following features.
+
+  ttulmgr list [-pv] [-ts num] [-sid num] upath
+
+
+  

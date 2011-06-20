@@ -37,8 +37,10 @@ static void printerr(const char *msg);
 static int printhex(const char *ptr, int size);
 static char *mygetline(FILE *ifp);
 static int runexport(int argc, char **argv);
+static int runlist(int argc, char **argv);
 static int runimport(int argc, char **argv);
 static int procexport(const char *upath, uint64_t ts, uint32_t sid);
+static int proclist(const char *upath, uint64_t ts, uint32_t sid, bool pv);
 static int procimport(const char *upath, uint64_t lim);
 
 
@@ -49,6 +51,8 @@ int main(int argc, char **argv){
   int rv = 0;
   if(!strcmp(argv[1], "export")){
     rv = runexport(argc, argv);
+  } else if(!strcmp(argv[1], "list")){
+    rv = runlist(argc, argv);
   } else if(!strcmp(argv[1], "import")){
     rv = runimport(argc, argv);
   } else {
@@ -63,6 +67,7 @@ static void usage(void){
   fprintf(stderr, "%s: test cases of the remote database API of Tokyo Tyrant\n", g_progname);
   fprintf(stderr, "\n");
   fprintf(stderr, "usage:\n");
+  fprintf(stderr, "  %s list [-pv] [-ts num] [-sid num] upath\n", g_progname);
   fprintf(stderr, "  %s export [-ts num] [-sid num] upath\n", g_progname);
   fprintf(stderr, "  %s import upath\n", g_progname);
   fprintf(stderr, "\n");
@@ -85,6 +90,63 @@ static int printhex(const char *ptr, int size){
     ptr++;
   }
   return len;
+}
+
+
+/* apply function to ulog record about key and value */
+bool ulogyieldkeyval(const char *ptr, int size, bool (*each)(const unsigned char *, uint32_t, const unsigned char *, uint32_t)) {
+  if(size < sizeof(uint8_t) * 3) return false;
+  const unsigned char *rp = (unsigned char *)ptr;
+  int magic = *(rp++);
+  int cmd = *(rp++);
+  //  bool exp = (((unsigned char *)ptr)[size-1] == 0) ? true : false;
+  size -= sizeof(uint8_t) * 3;
+  if(magic != TTMAGICNUM) return false;
+  bool err = false;
+  switch(cmd){
+    case TTCMDPUT:
+      if(size >= sizeof(uint32_t) * 2){
+        uint32_t ksiz;
+        memcpy(&ksiz, rp, sizeof(ksiz));
+        ksiz = TTNTOHL(ksiz);
+        rp += sizeof(ksiz);
+        uint32_t vsiz;
+        memcpy(&vsiz, rp, sizeof(vsiz));
+        vsiz = TTNTOHL(vsiz);
+        rp += sizeof(vsiz);
+        (*each)(rp, ksiz, rp + ksiz, vsiz);
+      } else {
+        err = true;
+      }
+      break;
+    default:
+      err = true;
+      break;
+  }
+  return !err;
+}
+
+
+/* print ulog record like "list" */
+bool ulogprintlnlist(const unsigned char *kbuf, uint32_t ksiz, const unsigned char *vbuf, uint32_t vsiz) {
+  char key[ksiz+1];
+  memcpy(&key, kbuf, ksiz);
+  key[ksiz] = '\0';
+  printf("%s\n", key);
+  return true;
+}
+
+
+/* print ulog record like "list -pv" */
+bool ulogprintlnlistpv(const unsigned char *kbuf, uint32_t ksiz, const unsigned char *vbuf, uint32_t vsiz) {
+  char key[ksiz+1];
+  char val[vsiz+1];
+  memcpy(&key, kbuf, ksiz);
+  memcpy(&val, vbuf, vsiz);
+  key[ksiz] = '\0';
+  val[vsiz] = '\0';
+  printf("%s\t%s\n", key, val);
+  return true;
 }
 
 
@@ -143,6 +205,37 @@ static int runexport(int argc, char **argv){
 }
 
 
+/* parse arguments of list command */
+static int runlist(int argc, char **argv){
+  char *upath = NULL;
+  bool pv = false;
+  uint64_t ts = 0;
+  uint32_t sid = UINT32_MAX;
+  for(int i = 2; i < argc; i++){
+    if(!upath && argv[i][0] == '-'){
+      if(!strcmp(argv[i], "-ts")){
+        if(++i >= argc) usage();
+        ts = ttstrtots(argv[i]);
+      } else if(!strcmp(argv[i], "-sid")){
+        if(++i >= argc) usage();
+        sid = tcatoi(argv[i]);
+      } else if(!strcmp(argv[i], "-pv")){
+        pv = true;
+      } else {
+        usage();
+      }
+    } else if(!upath){
+      upath = argv[i];
+    } else {
+      usage();
+    }
+  }
+  if(!upath) usage();
+  int rv = proclist(upath, ts, sid, pv);
+  return rv;
+}
+
+
 /* parse arguments of import command */
 static int runimport(int argc, char **argv){
   char *upath = NULL;
@@ -188,6 +281,42 @@ static int procexport(const char *upath, uint64_t ts, uint32_t sid){
         printf("%s\t", ttcmdidtostr(((unsigned char *)rbuf)[1]));
         printhex(rbuf, rsiz);
         putchar('\n');
+      } else {
+        printf("[broken entry]\n");
+      }
+    }
+    tculrddel(ulrd);
+  } else {
+    printerr("tculrdnew");
+    err = true;
+  }
+  if(!tculogclose(ulog)){
+    printerr("tculogclose");
+    err = true;
+  }
+  tculogdel(ulog);
+  return err ? 1 : 0;
+}
+
+
+/* perform list command. Only PUT cmd is listed. */
+static int proclist(const char *upath, uint64_t ts, uint32_t sid, bool pv){
+  TCULOG *ulog = tculognew();
+  if(!tculogopen(ulog, upath, 0)){
+    printerr("tculogopen");
+    return 1;
+  }
+  bool err = false;
+  TCULRD *ulrd = tculrdnew(ulog, ts);
+  if(ulrd){
+    const char *rbuf;
+    int rsiz;
+    uint64_t rts;
+    uint32_t rsid, rmid;
+    while(!err && (rbuf = tculrdread(ulrd, &rsiz, &rts, &rsid, &rmid)) != NULL){
+      if(rsid == sid || rmid == sid) continue;
+      if(rsiz >= 2){
+	ulogyieldkeyval(rbuf, rsiz, pv ? &ulogprintlnlistpv : &ulogprintlnlist);
       } else {
         printf("[broken entry]\n");
       }
